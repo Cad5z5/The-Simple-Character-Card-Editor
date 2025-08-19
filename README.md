@@ -1,5 +1,5 @@
-# Chargen-the-character-generator
-Chargen the character generator generates character cards in .json format or .PNG files
+# Chargen-the-character-Editor
+Using Chargen the character card editor you can write you own character card in .json format or as PNG file.
 
 Welcome to chargen v4 the character generator.
 
