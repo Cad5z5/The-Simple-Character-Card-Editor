@@ -36,8 +36,8 @@
 <header>
   <h1>Character Card V2 Generator <span class="badge">spec: "chara_card_v2"</span> <span class="badge">spec_version: "2.0"</span></h1>
   <div class="file-inline">
-    <input type="file" id="importFile" accept=".json,application/json">
-    <button id="btnImport" class="secondary">Import JSON</button>
+    <input type="file" id="importFile" accept=".json,application/json,image/png">
+    <button id="btnImport" class="secondary">Import Card (.json/.png)</button>
     <input type="file" id="imageFile" accept="image/png,image/jpeg">
     <span class="chip">Portrait for PNG export (PNG/JPEG)</span>
   </div>
@@ -140,7 +140,37 @@
 (function(){
   const $ = id => document.getElementById(id);
   const status = $('status'), hdrStatus = $('hdrStatus');
+  const TD = new TextDecoder();
 
+  // --- PNG/Binary Helper Functions ---
+  function readU32(buf, idx){ return ((buf[idx]<<24) | (buf[idx+1]<<16) | (buf[idx+2]<<8) | (buf[idx+3])) >>> 0; }
+  function str(u8){ return String.fromCharCode.apply(null, u8); }
+  function u32be(n){ const b=new Uint8Array(4); b[0]=(n>>>24)&255; b[1]=(n>>>16)&255; b[2]=(n>>>8)&255; b[3]=n&255; return b; }
+  function crcTableBuild(){
+    const table = new Uint32Array(256);
+    for (let n=0;n<256;n++){
+      let c = n;
+      for (let k=0;k<8;k++){ c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }
+      table[n] = c >>> 0;
+    }
+    return table;
+  }
+  const CRC_TABLE = crcTableBuild();
+  function crc32(bytes){
+    let c = 0xFFFFFFFF;
+    for (let i=0;i<bytes.length;i++){
+      c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function concat(...arrays){
+    let total = arrays.reduce((s,a)=>s+a.length,0);
+    const out = new Uint8Array(total);
+    let off=0;
+    for (const a of arrays){ out.set(a,off); off += a.length; }
+    return out;
+  }
+  
   // Preview portrait
   $('imageFile').addEventListener('change', () => {
     const f = $('imageFile').files[0];
@@ -153,25 +183,82 @@
   // Import trigger
   $('btnImport').addEventListener('click', () => $('importFile').click());
 
-  // Import handler
-  $('importFile').addEventListener('change', () => {
+  // Universal import handler for JSON and PNG
+  $('importFile').addEventListener('change', async () => {
     const file = $('importFile').files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const obj = JSON.parse(reader.result);
+
+    const processCardObject = (obj) => {
         if (!obj || obj.spec !== 'chara_card_v2' || obj.spec_version !== '2.0' || !obj.data) {
-          throw new Error('Not a Character Card V2 JSON.');
+          throw new Error('File does not contain valid Character Card V2 data.');
         }
         fillForm(obj.data);
-        ok(hdrStatus, 'Imported ' + file.name);
-      } catch(e) {
-        err(hdrStatus, 'Import failed: ' + e.message);
-      }
+        ok(hdrStatus, 'Successfully imported card: ' + file.name);
     };
-    reader.readAsText(file, 'utf-8');
+
+    try {
+        if (file.type === 'application/json' || file.name.toLowerCase().endsWith('.json')) {
+            const text = await file.text();
+            const obj = JSON.parse(text);
+            processCardObject(obj);
+        } else if (file.type === 'image/png' || file.name.toLowerCase().endsWith('.png')) {
+            // Also copy the imported PNG to the portrait slot for re-export
+            const r = new FileReader();
+            r.onload = () => { $('imgPreview').src = r.result; $('imgPreview').style.display='block'; };
+            r.readAsDataURL(file);
+            $('imageFile').files = $('importFile').files;
+
+            const obj = await extractDataFromPng(file);
+            processCardObject(obj);
+        } else {
+            throw new Error('Unsupported file type. Please select a .json or .png file.');
+        }
+    } catch (e) {
+        err(hdrStatus, 'Import failed: ' + e.message);
+    }
   });
+  
+  // Function to extract character data from a PNG tEXt chunk
+  function extractDataFromPng(pngBlob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const bytes = new Uint8Array(r.result);
+          const PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+          for (let i = 0; i < 8; i++) {
+            if (bytes[i] !== PNG_SIG[i]) throw new Error('Not a valid PNG file.');
+          }
+
+          let offset = 8;
+          while (offset < bytes.length) {
+            const len = readU32(bytes, offset);
+            const type = str(bytes.subarray(offset + 4, offset + 8));
+            
+            if (type === 'tEXt') {
+              const chunkData = bytes.subarray(offset + 8, offset + 8 + len);
+              const nullSeparatorIndex = chunkData.indexOf(0);
+              
+              if (nullSeparatorIndex !== -1) {
+                const keyword = TD.decode(chunkData.subarray(0, nullSeparatorIndex));
+                if (keyword === 'chara') {
+                  const base64EncodedText = TD.decode(chunkData.subarray(nullSeparatorIndex + 1));
+                  const jsonText = decodeURIComponent(escape(atob(base64EncodedText)));
+                  resolve(JSON.parse(jsonText));
+                  return;
+                }
+              }
+            }
+            if (type === 'IEND') break;
+            offset += 12 + len;
+          }
+          throw new Error('No Character Card V2 data found in PNG.');
+        } catch (e) { reject(e); }
+      };
+      r.onerror = () => reject(new Error('Failed to read PNG file.'));
+      r.readAsArrayBuffer(pngBlob);
+    });
+  }
 
   function fillForm(d){
     setVal('name', d.name);
@@ -245,7 +332,6 @@
     }catch(e){ err(status, 'Validation error: ' + e.message); }
   });
 
-  // JSON download
   $('btnDownload').addEventListener('click', () => {
     try{
       const obj = buildCard();
@@ -264,7 +350,6 @@
     }catch(e){ err(status, 'Download error: ' + e.message); }
   });
 
-  // PNG export
   $('btnPNG').addEventListener('click', async () => {
     try{
       const obj = buildCard();
@@ -284,7 +369,6 @@
     }catch(e){ err(status, 'PNG export error: ' + e.message); }
   });
 
-  // Render base PNG from uploaded portrait or fallback canvas
   function renderBasePNG(){
     return new Promise((resolve,reject)=>{
       const file = $('imageFile').files[0];
@@ -306,7 +390,6 @@
         r.onerror = () => reject(new Error('Portrait file reading failed'));
         r.readAsDataURL(file);
       } else {
-        // Fallback: simple background with name
         canvas.width = 768; canvas.height = 1024;
         const g = ctx.createLinearGradient(0,0,0,canvas.height);
         g.addColorStop(0,'#141a2b'); g.addColorStop(1,'#0c1020');
@@ -319,45 +402,13 @@
     });
   }
 
-  // PNG utilities
-  function u32be(n){ const b=new Uint8Array(4); b[0]=(n>>>24)&255; b[1]=(n>>>16)&255; b[2]=(n>>>8)&255; b[3]=n&255; return b; }
-  function crcTableBuild(){
-    const table = new Uint32Array(256);
-    for (let n=0;n<256;n++){
-      let c = n;
-      for (let k=0;k<8;k++){ c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }
-      table[n] = c >>> 0;
-    }
-    return table;
-  }
-  const CRC_TABLE = crcTableBuild();
-  function crc32(bytes){
-    let c = 0xFFFFFFFF;
-    for (let i=0;i<bytes.length;i++){
-      c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
-    }
-    return (c ^ 0xFFFFFFFF) >>> 0;
-  }
-  function concat(...arrays){
-    let total = arrays.reduce((s,a)=>s+a.length,0);
-    const out = new Uint8Array(total);
-    let off=0;
-    for (const a of arrays){ out.set(a,off); off += a.length; }
-    return out;
-  }
-
-  // Build a tEXt chunk with keyword and text (BASE64 ENCODED)
   function makeTextChunk(keyword, text){
     const te = new TextEncoder();
     const key = (keyword || 'chara').slice(0,79).replace(/\0/g,'');
     const keyBytes = te.encode(key);
-    const sep = new Uint8Array([0]); // null separator
-    
-    // CORRECTED PART: Base64 encode the JSON string to make it compatible.
-    // The unescape(encodeURIComponent(text)) is a robust way to handle Unicode characters in btoa.
+    const sep = new Uint8Array([0]);
     const base64EncodedText = btoa(unescape(encodeURIComponent(text)));
     const txtBytes = te.encode(base64EncodedText);
-
     const type = te.encode('tEXt');
     const data = concat(keyBytes, sep, txtBytes);
     const len = u32be(data.length);
@@ -365,29 +416,23 @@
     return concat(len, type, data, crc);
   }
 
-  // Insert tEXt chunk immediately after IHDR
   function embedTextChunk(pngBlob, keyword, text){
     return new Promise((resolve,reject)=>{
       const r = new FileReader();
       r.onload = () => {
         try{
           const bytes = new Uint8Array(r.result);
-          // Verify signature
-          const sig = bytes.subarray(0,8);
+          const sig = bytes.subarray(0, 8);
           const PNG_SIG = new Uint8Array([137,80,78,71,13,10,26,10]);
           for (let i=0;i<8;i++) if (sig[i] !== PNG_SIG[i]) throw new Error('Not a PNG');
-
-          // Locate end of IHDR
           let off = 8;
           const ihdrLen = readU32(bytes, off); off += 4;
           const type = str(bytes.subarray(off, off+4)); off += 4;
           if (type !== 'IHDR') throw new Error('Missing IHDR');
-          off += ihdrLen; // IHDR data
-          off += 4; // IHDR CRC
-
+          off += ihdrLen;
+          off += 4;
           const head = bytes.subarray(0, off);
           const tail = bytes.subarray(off);
-
           const textChunk = makeTextChunk(keyword, text);
           const out = concat(head, textChunk, tail);
           resolve(out);
@@ -396,12 +441,8 @@
       r.onerror = () => reject(new Error('PNG read failed'));
       r.readAsArrayBuffer(pngBlob);
     });
-
-    function readU32(buf, idx){ return ((buf[idx]<<24) | (buf[idx+1]<<16) | (buf[idx+2]<<8) | (buf[idx+3])) >>> 0; }
-    function str(u8){ return String.fromCharCode.apply(null, u8); }
   }
 
-  // Reset form
   $('btnReset').addEventListener('click', () => {
     if (!confirm('Clear all fields?')) return;
     document.querySelectorAll('input[type="text"], textarea').forEach(el => el.value = '');
@@ -413,7 +454,6 @@
     note(hdrStatus, '');
   });
 
-  // Helpful defaults
   $('tags').value = 'generator\nstorycraft\nsci-fi';
 })();
 </script>
