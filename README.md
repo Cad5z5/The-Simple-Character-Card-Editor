@@ -1,3 +1,4 @@
+# 
 The-Simple-Character-Card-Editor
 
 When using the simple character card editor you can write you own character card in .json format or as PNG file.
